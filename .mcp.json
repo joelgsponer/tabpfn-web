@@ -1,0 +1,14 @@
+
+{
+  "mcpServers": {
+    "promptcaddy": {
+      "command": "/Users/federerj/Documents/ai/PromptCaddy/promptcaddy",
+      "args": [
+        "serve",
+        "--dir",
+        "/Users/federerj/Documents/ai/PromptCaddy/prompts"
+      ],
+      "env": {}
+    }
+  }
+}

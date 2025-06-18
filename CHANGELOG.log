@@ -1,0 +1,60 @@
+# TabPFN Frontend Implementation Changelog
+
+## Project Start: 2025-06-18
+
+### Phase 1: Foundation (Target: 1-2 weeks)
+
+#### 2025-06-18 - Initial Setup
+- [x] Initialize React project with Vite
+- [x] Configure Tailwind CSS
+- [x] Setup shadcn/ui components library
+- [x] Create basic page structure (Header, main content area)
+- [x] Develop FileUpload component (CSV, XLSX parsing, basic validation)
+- [x] Develop DataTablePreview component (displaying sample data, target column selection)
+- [x] Setup Python backend with Flask/FastAPI
+- [x] Implement basic backend API endpoint for data reception
+
+### Completed Components:
+
+**Frontend Structure:**
+- Created React app with Vite at `/frontend`
+- Configured Tailwind CSS with Inter font and custom theme colors
+- Set up shadcn/ui component library with utilities
+
+**Components Implemented:**
+1. **Header.jsx** - Application header with branding
+2. **FileUpload.jsx** - Drag-and-drop file upload with CSV/Excel support
+3. **DataTablePreview.jsx** - Data preview table with target column selection
+4. **LoadingSpinner.jsx** - Loading state indicator
+5. **ErrorMessage.jsx** - Error display component
+6. **UI Components:**
+   - Button, Card, Select, Table components from shadcn/ui
+
+**Backend Setup:**
+- Created FastAPI backend at `/backend/app.py`
+- Implemented `/predict` endpoint with placeholder RandomForest model
+- Added CORS middleware for frontend communication
+- Created requirements.txt with necessary dependencies
+
+**Current Status:**
+- Phase 1 milestone achieved: User can upload a file, see a preview, select a target column
+- Frontend communicates with backend (currently returns "Backend API not yet implemented" error)
+- Ready to proceed with Phase 2: Core Functionality
+
+**Next Steps:**
+- Integrate actual TabPFN model into backend
+- Implement ResultsDashboard components
+- Add visualization components (ConfusionMatrix, ROC Curve)
+- Implement SHAP value computation
+
+### Progress Summary
+Starting implementation of TabPFN Frontend Application as specified in PLAN.md. The project aims to create an intuitive web interface for TabPFN model with features including:
+- File upload (CSV/XLSX)
+- Data preview with target column selection
+- Model predictions visualization
+- SHAP value explanations
+- Results download
+
+Technical stack:
+- Frontend: React.js, Tailwind CSS, shadcn/ui, Recharts/Nivo
+- Backend: Flask/FastAPI, TabPFN, pandas, scikit-learn, shap

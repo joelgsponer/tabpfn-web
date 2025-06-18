@@ -1,0 +1,90 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.11.11, pytest-7.4.3, pluggy-1.6.0 -- /Users/federerj/Documents/ai/tabpfn/backend/.venv/bin/python3
+cachedir: .pytest_cache
+rootdir: /Users/federerj/Documents/ai/tabpfn/backend
+plugins: asyncio-0.21.1, anyio-3.7.1
+asyncio: mode=Mode.STRICT
+collecting ... collected 12 items
+
+test_backend.py::TestBackendWithIris::test_root_endpoint PASSED          [  8%]
+test_backend.py::TestBackendWithIris::test_predict_with_iris_dataset PASSED [ 16%]
+test_backend.py::TestBackendWithIris::test_predict_with_numeric_target FAILED [ 25%]
+test_backend.py::TestBackendWithIris::test_predict_with_missing_target_column FAILED [ 33%]
+test_backend.py::TestBackendWithIris::test_predict_with_binary_classification PASSED [ 41%]
+test_backend.py::TestBackendWithIris::test_predict_with_small_dataset PASSED [ 50%]
+test_backend.py::TestBackendWithIris::test_shap_endpoint_placeholder PASSED [ 58%]
+test_backend.py::TestBackendWithIris::test_predict_with_missing_values PASSED [ 66%]
+test_backend.py::TestBackendWithIris::test_predict_with_different_dataset_sizes[10] PASSED [ 75%]
+test_backend.py::TestBackendWithIris::test_predict_with_different_dataset_sizes[50] PASSED [ 83%]
+test_backend.py::TestBackendWithIris::test_predict_with_different_dataset_sizes[100] PASSED [ 91%]
+test_backend.py::TestBackendWithIris::test_predict_with_different_dataset_sizes[150] PASSED [100%]
+
+=================================== FAILURES ===================================
+_____________ TestBackendWithIris.test_predict_with_numeric_target _____________
+
+self = <test_backend.TestBackendWithIris object at 0x13cd24250>
+iris_data =      sepal length (cm)  sepal width (cm)  ...  petal width (cm)  target
+0                  5.1               3.5  ... ...            2.3       2
+149                5.9               3.0  ...               1.8       2
+
+[150 rows x 5 columns]
+
+    def test_predict_with_numeric_target(self, iris_data):
+        """Test prediction with numeric target values."""
+        # Convert back to numeric targets
+        iris_data['target'] = iris_data['target'].map({'setosa': 0, 'versicolor': 1, 'virginica': 2})
+        request_data = {
+            "data": iris_data.to_dict(orient='records'),
+            "target_column": "target"
+        }
+    
+        response = client.post("/predict", json=request_data)
+>       assert response.status_code == 200
+E       assert 500 == 200
+E        +  where 500 = <Response [500 Internal Server Error]>.status_code
+
+test_backend.py:88: AssertionError
+----------------------------- Captured stderr call -----------------------------
+ERROR:app:Prediction error: cannot access local variable 'target_encoder' where it is not associated with a value
+INFO:httpx:HTTP Request: POST http://testserver/predict "HTTP/1.1 500 Internal Server Error"
+------------------------------ Captured log call -------------------------------
+ERROR    app:app.py:133 Prediction error: cannot access local variable 'target_encoder' where it is not associated with a value
+INFO     httpx:_client.py:1013 HTTP Request: POST http://testserver/predict "HTTP/1.1 500 Internal Server Error"
+_________ TestBackendWithIris.test_predict_with_missing_target_column __________
+
+self = <test_backend.TestBackendWithIris object at 0x13cd24910>
+iris_json_data = [{'petal length (cm)': 1.4, 'petal width (cm)': 0.2, 'sepal length (cm)': 5.1, 'sepal width (cm)': 3.5, ...}, {'petal ......}, {'petal length (cm)': 1.7, 'petal width (cm)': 0.4, 'sepal length (cm)': 5.4, 'sepal width (cm)': 3.9, ...}, ...]
+
+    def test_predict_with_missing_target_column(self, iris_json_data):
+        """Test error handling when target column is missing."""
+        request_data = {
+            "data": iris_json_data,
+            "target_column": "non_existent_column"
+        }
+    
+        response = client.post("/predict", json=request_data)
+>       assert response.status_code == 400
+E       assert 500 == 400
+E        +  where 500 = <Response [500 Internal Server Error]>.status_code
+
+test_backend.py:102: AssertionError
+----------------------------- Captured stderr call -----------------------------
+ERROR:app:Prediction error: 
+INFO:httpx:HTTP Request: POST http://testserver/predict "HTTP/1.1 500 Internal Server Error"
+------------------------------ Captured log call -------------------------------
+ERROR    app:app.py:133 Prediction error: 
+INFO     httpx:_client.py:1013 HTTP Request: POST http://testserver/predict "HTTP/1.1 500 Internal Server Error"
+=============================== warnings summary ===============================
+test_backend.py::TestBackendWithIris::test_predict_with_small_dataset
+  /Users/federerj/Documents/ai/tabpfn/backend/.venv/lib/python3.11/site-packages/sklearn/metrics/_classification.py:1471: UndefinedMetricWarning: Precision and F-score are ill-defined and being set to 0.0 in labels with no predicted samples. Use `zero_division` parameter to control this behavior.
+    _warn_prf(average, modifier, msg_start, len(result))
+
+test_backend.py::TestBackendWithIris::test_predict_with_small_dataset
+  /Users/federerj/Documents/ai/tabpfn/backend/.venv/lib/python3.11/site-packages/sklearn/metrics/_classification.py:1471: UndefinedMetricWarning: Recall and F-score are ill-defined and being set to 0.0 in labels with no true samples. Use `zero_division` parameter to control this behavior.
+    _warn_prf(average, modifier, msg_start, len(result))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED test_backend.py::TestBackendWithIris::test_predict_with_numeric_target
+FAILED test_backend.py::TestBackendWithIris::test_predict_with_missing_target_column
+=================== 2 failed, 10 passed, 2 warnings in 0.42s ===================

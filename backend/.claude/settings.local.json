@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest test_backend.py -v)"
+    ],
+    "deny": []
+  }
+}
