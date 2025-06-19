@@ -11,10 +11,25 @@ import pickle
 import base64
 from io import BytesIO
 import torch
+import warnings
+
+# Suppress NumPy FutureWarning about random seeding (common in SHAP/TabPFN)
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*np.random.seed.*")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# SHAP related imports
+try:
+    import shap
+    import shapiq
+    from tabpfn_extensions.interpretability.shapiq import get_tabpfn_explainer
+    SHAP_AVAILABLE = True
+    logger.info("SHAP libraries loaded successfully")
+except ImportError as e:
+    logger.warning(f"SHAP libraries not available: {e}")
+    SHAP_AVAILABLE = False
 
 app = FastAPI(title="TabPFN API", version="1.0.0")
 
@@ -51,9 +66,38 @@ class PredictResponse(BaseModel):
     model_metadata: Optional[Dict[str, Any]] = None
 
 class ShapRequest(BaseModel):
-    data: List[Dict[str, Any]]
-    target_column: str
-    instance_index: Optional[int] = None
+    model_config = {"protected_namespaces": ()}
+    
+    model_data: str  # Base64 encoded model package
+    data: List[Dict[str, Any]]  # Full dataset for background context
+    instance_index: Optional[int] = None  # Which instance to explain (default: first)
+    
+class ShapResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    
+    shap_values: Dict[str, float]  # Feature name to SHAP value mapping
+    baseline_value: float
+    predicted_value: float
+    feature_names: List[str]
+    instance_values: Dict[str, Any]  # Actual feature values for the explained instance
+    interpretation: str  # Text interpretation of the results
+
+class ShapOverviewRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    
+    model_data: str  # Base64 encoded model package
+    data: List[Dict[str, Any]]  # Full dataset for background context
+    num_instances: Optional[int] = 20  # Number of instances to compute SHAP for
+    
+class ShapOverviewResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    
+    feature_names: List[str]
+    shap_values_matrix: List[List[float]]  # Each row is SHAP values for one instance
+    feature_values_matrix: List[List[Any]]  # Each row is feature values for one instance
+    baseline_value: float
+    mean_abs_shap: Dict[str, float]  # Mean absolute SHAP value per feature
+    summary_plot_data: Dict[str, Any]  # Data for creating summary plots
 
 @app.get("/")
 async def root():
@@ -78,13 +122,15 @@ def detect_best_device():
     """Detect the best available device for TabPFN"""
     if torch.cuda.is_available():
         device = 'cuda'
-        logger.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        logger.info(f"CUDA GPU available: {gpu_name} ({gpu_memory:.1f}GB)")
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = 'mps'
-        logger.info("Apple Silicon GPU (MPS) available")
+        logger.info("Apple Silicon GPU (MPS) available for TabPFN and SHAP computation")
     else:
         device = 'cpu'
-        logger.info("Using CPU (no GPU detected)")
+        logger.info("Using CPU (no GPU detected) - SHAP computation may be slower")
     
     return device
 
@@ -188,26 +234,62 @@ async def predict(request: PredictRequest):
         logger.info(f"Categorical columns for one-hot encoding: {categorical_cols}")
         
         if categorical_cols:
-            # Apply one-hot encoding
-            ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop='first')
+            # Check cardinality of categorical columns to avoid feature explosion
+            high_cardinality_cols = []
+            for col in categorical_cols:
+                unique_count = X_train[col].nunique()
+                if unique_count > 20:  # Limit to 20 unique values per categorical column
+                    high_cardinality_cols.append(col)
+                    logger.warning(f"Column '{col}' has {unique_count} unique values, will use label encoding instead")
             
-            # Fit on training data
-            X_train_categorical = ohe.fit_transform(X_train[categorical_cols])
-            X_test_categorical = ohe.transform(X_test[categorical_cols])
+            # Remove high cardinality columns from one-hot encoding
+            cols_for_onehot = [col for col in categorical_cols if col not in high_cardinality_cols]
+            logger.info(f"Columns for one-hot encoding (after filtering): {cols_for_onehot}")
             
-            # Get feature names
-            feature_names = ohe.get_feature_names_out(categorical_cols)
+            # Estimate final feature count
+            current_numeric_features = len(X_train.columns) - len(categorical_cols)
+            estimated_onehot_features = sum(min(X_train[col].nunique() - 1, 19) for col in cols_for_onehot)  # -1 for drop='first'
+            estimated_label_encoded = len(high_cardinality_cols)
+            total_estimated_features = current_numeric_features + estimated_onehot_features + estimated_label_encoded
             
-            # Create DataFrames for encoded categorical features
-            X_train_cat_df = pd.DataFrame(X_train_categorical, columns=feature_names, index=X_train.index)
-            X_test_cat_df = pd.DataFrame(X_test_categorical, columns=feature_names, index=X_test.index)
+            logger.info(f"Feature count estimation: {current_numeric_features} numeric + {estimated_onehot_features} one-hot + {estimated_label_encoded} label = {total_estimated_features} total")
             
-            # Drop original categorical columns and concatenate encoded ones
-            X_train = pd.concat([X_train.drop(columns=categorical_cols), X_train_cat_df], axis=1)
-            X_test = pd.concat([X_test.drop(columns=categorical_cols), X_test_cat_df], axis=1)
+            if total_estimated_features > 100:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Dataset would result in {total_estimated_features} features after encoding, but TabPFN supports max 100 features. Please exclude more columns or reduce categorical feature cardinality."
+                )
             
-            encoders['onehot'] = ohe
-            logger.info(f"Applied one-hot encoding, resulting in {len(feature_names)} new features")
+            # Apply one-hot encoding to low-cardinality columns
+            if cols_for_onehot:
+                ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop='first')
+                
+                # Fit on training data
+                X_train_categorical = ohe.fit_transform(X_train[cols_for_onehot])
+                X_test_categorical = ohe.transform(X_test[cols_for_onehot])
+                
+                # Get feature names
+                feature_names = ohe.get_feature_names_out(cols_for_onehot)
+                
+                # Create DataFrames for encoded categorical features
+                X_train_cat_df = pd.DataFrame(X_train_categorical, columns=feature_names, index=X_train.index)
+                X_test_cat_df = pd.DataFrame(X_test_categorical, columns=feature_names, index=X_test.index)
+                
+                # Drop original one-hot encoded columns and concatenate encoded ones
+                X_train = pd.concat([X_train.drop(columns=cols_for_onehot), X_train_cat_df], axis=1)
+                X_test = pd.concat([X_test.drop(columns=cols_for_onehot), X_test_cat_df], axis=1)
+                
+                encoders['onehot'] = ohe
+                encoders['onehot_columns'] = cols_for_onehot  # Store which columns were one-hot encoded
+                logger.info(f"Applied one-hot encoding, resulting in {len(feature_names)} new features")
+            
+            # Apply label encoding to high-cardinality columns
+            for col in high_cardinality_cols:
+                le = LabelEncoder()
+                X_train[col] = le.fit_transform(X_train[col].astype(str))
+                X_test[col] = le.transform(X_test[col].astype(str))
+                encoders[col] = le
+                logger.info(f"Applied label encoding to high-cardinality column: {col}")
         
         # Handle any remaining non-numeric columns with label encoding (fallback)
         for col in X_train.columns:
@@ -305,7 +387,28 @@ async def predict(request: PredictRequest):
             for attempt in range(2):
                 try:
                     if attempt == 0:
-                        model = TabPFNClassifier(device=device_to_use)
+                        # Configure model parameters based on device
+                        model_params = {
+                            'device': device_to_use,
+                            'random_state': config['random_state'],
+                            'N_ensemble_configurations': config['N_ensemble_configurations']
+                        }
+                        
+                        # Add additional parameters from demo script if available
+                        if 'n_estimators' in config:
+                            model_params['n_estimators'] = config['n_estimators']
+                        if 'n_jobs' in config:
+                            model_params['n_jobs'] = config['n_jobs']
+                        
+                        # Add MPS-specific optimizations
+                        if device_to_use == 'mps':
+                            model_params.update({
+                                'memory_saving_mode': True,
+                                'ignore_pretraining_limits': True
+                            })
+                            logger.info("Using MPS-specific optimizations: memory_saving_mode=True, ignore_pretraining_limits=True")
+                        
+                        model = TabPFNClassifier(**model_params)
                         logger.info(f"TabPFNClassifier initialized with device: {device_to_use}")
                     else:
                         # Second attempt with CPU
@@ -326,15 +429,27 @@ async def predict(request: PredictRequest):
                         # CPU also failed, raise the error
                         raise e
             
-            # Make predictions
-            y_pred = model.predict(X_test)
+            # Make predictions with MPS fallback
+            try:
+                y_pred = model.predict(X_test)
+            except Exception as e:
+                if "MPS" in str(e) or "Memory estimation" in str(e):
+                    logger.warning(f"MPS device issue during predict, recreating model with CPU: {e}")
+                    # Recreate model with CPU and refit
+                    model = TabPFNClassifier(device='cpu')
+                    model.fit(X_train, y_train)
+                    y_pred = model.predict(X_test)
+                    device_to_use = 'cpu'  # Update device tracking
+                    logger.info("Prediction successful on CPU after MPS failure")
+                else:
+                    raise e
             
             # Calculate metrics
             accuracy = accuracy_score(y_test, y_pred)
             precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred, average=None, zero_division=0)
             cm = confusion_matrix(y_test, y_pred)
             
-            # Calculate ROC data for binary classification
+            # Calculate ROC data for binary classification with MPS fallback
             roc_data = None
             if len(classes) == 2:
                 try:
@@ -348,8 +463,23 @@ async def predict(request: PredictRequest):
                     }
                     logger.info(f"ROC AUC: {auc:.4f}")
                 except Exception as e:
-                    logger.warning(f"Could not compute ROC curve: {e}")
-                    pass
+                    if "MPS" in str(e) or "Memory estimation" in str(e):
+                        logger.warning(f"MPS device issue during predict_proba, using CPU model: {e}")
+                        # Model should already be CPU from above fallback
+                        try:
+                            y_proba = model.predict_proba(X_test)[:, 1]
+                            fpr, tpr, _ = roc_curve(y_test, y_proba)
+                            auc = roc_auc_score(y_test, y_proba)
+                            roc_data = {
+                                "fpr": fpr.tolist(),
+                                "tpr": tpr.tolist(),
+                                "auc": float(auc)
+                            }
+                            logger.info(f"ROC AUC (CPU): {auc:.4f}")
+                        except Exception as e2:
+                            logger.warning(f"Could not compute ROC curve even with CPU: {e2}")
+                    else:
+                        logger.warning(f"Could not compute ROC curve: {e}")
         else:
             # Regression task
             n_samples, n_features = X_train.shape
@@ -382,7 +512,27 @@ async def predict(request: PredictRequest):
                 for attempt in range(2):
                     try:
                         if attempt == 0:
-                            model = TabPFNRegressor(device=device_to_use)
+                            # Configure model parameters based on device
+                            model_params = {
+                                'device': device_to_use,
+                                'random_state': config['random_state']
+                            }
+                            
+                            # Add additional parameters from demo script if available
+                            if 'n_estimators' in config:
+                                model_params['n_estimators'] = config['n_estimators']
+                            if 'n_jobs' in config:
+                                model_params['n_jobs'] = config['n_jobs']
+                            
+                            # Add MPS-specific optimizations
+                            if device_to_use == 'mps':
+                                model_params.update({
+                                    'memory_saving_mode': True,
+                                    'ignore_pretraining_limits': True
+                                })
+                                logger.info("Using MPS-specific optimizations for regression: memory_saving_mode=True, ignore_pretraining_limits=True")
+                            
+                            model = TabPFNRegressor(**model_params)
                             logger.info(f"TabPFNRegressor initialized with device: {device_to_use}")
                         else:
                             # Second attempt with CPU
@@ -483,18 +633,21 @@ async def predict(request: PredictRequest):
         # Apply one-hot encoding if it was used
         if 'onehot' in encoders:
             ohe = encoders['onehot']
-            if categorical_cols:
-                # Apply one-hot encoding to categorical columns
-                X_full_categorical = ohe.transform(X_full[categorical_cols])
-                feature_names = ohe.get_feature_names_out(categorical_cols)
-                X_full_cat_df = pd.DataFrame(X_full_categorical, columns=feature_names, index=X_full.index)
-                
-                # Drop original categorical columns and concatenate encoded ones
-                X_full = pd.concat([X_full.drop(columns=categorical_cols), X_full_cat_df], axis=1)
+            onehot_columns = encoders.get('onehot_columns', [])
+            if onehot_columns:
+                cols_to_encode = [col for col in onehot_columns if col in X_full.columns]
+                if cols_to_encode:
+                    # Apply one-hot encoding to the same columns as training
+                    X_full_categorical = ohe.transform(X_full[cols_to_encode])
+                    feature_names = ohe.get_feature_names_out(cols_to_encode)
+                    X_full_cat_df = pd.DataFrame(X_full_categorical, columns=feature_names, index=X_full.index)
+                    
+                    # Drop original categorical columns and concatenate encoded ones
+                    X_full = pd.concat([X_full.drop(columns=cols_to_encode), X_full_cat_df], axis=1)
         
-        # Apply label encoding to remaining columns
+        # Apply label encoding to remaining columns  
         for col, encoder in encoders.items():
-            if col != 'onehot' and col in X_full.columns:
+            if col not in ['onehot', 'onehot_columns'] and col in X_full.columns:
                 X_full[col] = encoder.transform(X_full[col].astype(str))
         
         # Make predictions on full dataset with MPS fallback handling
@@ -584,16 +737,496 @@ async def predict(request: PredictRequest):
         logger.error(f"Prediction error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/shap")
+@app.post("/shap", response_model=ShapResponse)
 async def compute_shap(request: ShapRequest):
-    # TODO: Implement SHAP value computation
-    # This will require the trained model from the predict endpoint
-    # For now, return a placeholder
-    return {
-        "message": "SHAP computation not yet implemented",
-        "feature_importance": {},
-        "shap_values": []
-    }
+    try:
+        if not SHAP_AVAILABLE:
+            raise HTTPException(
+                status_code=501, 
+                detail="SHAP libraries not available. Please install: pip install shap shapiq tabpfn-extensions"
+            )
+        
+        logger.info("Starting SHAP computation...")
+        
+        # Decode model package
+        try:
+            model_bytes = base64.b64decode(request.model_data)
+            buffer = BytesIO(model_bytes)
+            model_package = pickle.load(buffer)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to decode model data: {str(e)}")
+        
+        # Extract components from model package
+        model = model_package['model']
+        encoders = model_package['encoders']
+        target_encoder = model_package.get('target_encoder')
+        feature_columns = model_package['feature_columns']
+        target_column = model_package['target_column']
+        column_types = model_package.get('column_types', {})
+        classes = model_package.get('classes', [])
+        
+        # Convert request data to DataFrame
+        df = pd.DataFrame(request.data)
+        
+        # Apply same preprocessing as training
+        logger.info("Applying preprocessing for SHAP...")
+        
+        # Apply column type conversions
+        for col in df.columns:
+            col_type = column_types.get(col, 'auto')
+            if col_type == 'numeric':
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            elif col_type == 'integer':
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+            elif col_type == 'categorical':
+                df[col] = df[col].astype('category')
+        
+        # Prepare features and target
+        X = df[feature_columns]
+        y = df[target_column] if target_column in df.columns else None
+        
+        # Apply same encoding as training
+        # First, identify categorical columns using the SAME logic as training
+        categorical_cols = []
+        for col in X.columns:
+            col_type = column_types.get(col, 'auto')
+            if X[col].dtype in ['object', 'category'] or col_type in ['categorical', 'text']:
+                categorical_cols.append(col)
+        
+        logger.info(f"SHAP: Categorical columns detected: {categorical_cols}")
+        logger.info(f"SHAP: OneHot encoder available: {'onehot' in encoders}")
+        
+        # Apply one-hot encoding if it was used during training
+        if 'onehot' in encoders:
+            ohe = encoders['onehot']
+            # Get the columns that were one-hot encoded during training
+            onehot_columns = encoders.get('onehot_columns', [])
+            logger.info(f"SHAP: Columns that were one-hot encoded during training: {onehot_columns}")
+            
+            # Only apply to columns that exist in current data and were one-hot encoded during training
+            cols_to_encode = [col for col in onehot_columns if col in X.columns]
+            logger.info(f"SHAP: Columns to one-hot encode: {cols_to_encode}")
+            
+            if cols_to_encode:
+                try:
+                    # Apply one-hot encoding to the same columns as training
+                    X_categorical = ohe.transform(X[cols_to_encode])
+                    feature_names = ohe.get_feature_names_out(cols_to_encode)
+                    X_cat_df = pd.DataFrame(X_categorical, columns=feature_names, index=X.index)
+                    
+                    # Drop original categorical columns and concatenate encoded ones
+                    X = pd.concat([X.drop(columns=cols_to_encode), X_cat_df], axis=1)
+                    logger.info(f"SHAP: Applied one-hot encoding, resulting features: {X.columns.tolist()}")
+                except Exception as e:
+                    logger.warning(f"SHAP: One-hot encoding failed: {e}")
+                    # Continue without one-hot encoding
+        
+        # Apply label encoding to remaining columns
+        for col, encoder in encoders.items():
+            if col not in ['onehot', 'onehot_columns'] and col in X.columns:
+                X[col] = encoder.transform(X[col].astype(str))
+        
+        # Add debugging for feature matrix
+        logger.info(f"SHAP: Final feature matrix shape: {X.shape}")
+        logger.info(f"SHAP: Feature columns: {X.columns.tolist()}")
+        logger.info(f"SHAP: Feature matrix sample:\n{X.head(3)}")
+        
+        # Check for constant features
+        constant_features = []
+        for col in X.columns:
+            if X[col].nunique() <= 1:
+                constant_features.append(col)
+        
+        if constant_features:
+            logger.warning(f"SHAP: Found constant features: {constant_features}")
+            # If ALL features are constant, this is a serious issue
+            if len(constant_features) == len(X.columns):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"All features are constant after preprocessing. This usually indicates a data preprocessing issue. Constant features: {constant_features}"
+                )
+        
+        # Select instance to explain
+        instance_index = request.instance_index or 0
+        if instance_index >= len(X):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Instance index {instance_index} out of range. Dataset has {len(X)} samples."
+            )
+        
+        X_instance = X.iloc[instance_index:instance_index+1]
+        
+        # Use a larger background set and ensure it has variability
+        background_size = min(100, len(X))
+        # Try to get a diverse background by sampling if dataset is large enough
+        if len(X) > background_size:
+            # Sample background data to ensure diversity
+            background_indices = np.random.choice(len(X), size=background_size, replace=False)
+            X_background = X.iloc[background_indices]
+        else:
+            X_background = X.iloc[:background_size]
+        
+        logger.info(f"SHAP: Instance to explain shape: {X_instance.shape}")
+        logger.info(f"SHAP: Background data shape: {X_background.shape}")
+        
+        logger.info(f"Explaining instance {instance_index} with background of {len(X_background)} samples")
+        
+        # Get model prediction for the instance
+        try:
+            if hasattr(model, 'predict_proba'):
+                # Classification
+                prediction = model.predict_proba(X_instance)[0]
+                if len(classes) == 2:
+                    predicted_value = float(prediction[1])  # Probability of positive class
+                    class_index = 1
+                else:
+                    predicted_value = float(np.max(prediction))
+                    class_index = int(np.argmax(prediction))
+            else:
+                # Regression
+                prediction = model.predict(X_instance)
+                predicted_value = float(prediction[0])
+                class_index = None
+        except Exception as e:
+            logger.warning(f"Prediction failed, using fallback: {e}")
+            predicted_value = 0.0
+            class_index = None
+        
+        # Apply target encoding if it was used during training
+        y_background = None
+        if y is not None and target_encoder is not None:
+            y_background = target_encoder.transform(y[:len(X_background)].astype(str))
+        elif y is not None:
+            y_background = y[:len(X_background)].values
+        
+        # Get feature names for SHAP computation
+        feature_names = X.columns.tolist()
+        
+        # Create SHAP explainer
+        logger.info("Creating SHAP explainer...")
+        try:
+            explainer = get_tabpfn_explainer(
+                model=model,
+                data=X_background.values,
+                labels=y_background if y_background is not None else np.zeros(len(X_background)),
+                index="SV",  # Standard Shapley Values - most reliable option
+                class_index=class_index if class_index is not None else None
+            )
+            
+            # Compute SHAP values
+            budget = min(1000, 2**len(feature_names))  # Adaptive budget based on number of features
+            # Detect current device for logging
+            current_device = detect_best_device()
+            logger.info(f"Computing SHAP values for instance {instance_index} with budget {budget} on device: {current_device}")
+            
+            import time
+            start_time = time.time()
+            shap_result = explainer.explain(X_instance.values, budget=budget)
+            computation_time = time.time() - start_time
+            logger.info(f"SHAP computation completed in {computation_time:.2f}s")
+            
+            # Extract SHAP values and create feature mapping
+            shap_values_dict = {}
+            
+            if hasattr(shap_result, 'dict_values'):
+                # shapiq format - dict_values contains tuples as keys
+                baseline_value = float(shap_result.dict_values.get((), 0.0))  # Empty tuple is baseline
+                
+                # Extract individual feature contributions
+                for key, shap_val in shap_result.dict_values.items():
+                    if isinstance(key, tuple) and len(key) == 1:  # Single feature index
+                        feature_idx = key[0]
+                        if feature_idx < len(feature_names):
+                            shap_values_dict[feature_names[feature_idx]] = float(shap_val)
+                
+                # If no baseline found in dict_values, try the baseline_value attribute
+                if baseline_value == 0.0 and hasattr(shap_result, 'baseline_value'):
+                    baseline_value = float(shap_result.baseline_value)
+            else:
+                # Fallback format
+                baseline_value = float(getattr(shap_result, 'baseline_value', 0.0))
+                if hasattr(shap_result, 'values'):
+                    for i, feature_name in enumerate(feature_names):
+                        if i < len(shap_result.values):
+                            shap_values_dict[feature_name] = float(shap_result.values[i])
+            
+            # Get instance values for interpretation
+            instance_values = {}
+            original_instance = df.iloc[instance_index]
+            for col in feature_columns:
+                instance_values[col] = original_instance[col]
+            
+            # Create interpretation text
+            top_features = sorted(shap_values_dict.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+            interpretation_parts = []
+            
+            if len(classes) == 2:  # Binary classification
+                interpretation_parts.append(f"Predicted probability: {predicted_value:.3f}")
+            elif len(classes) > 2:  # Multi-class classification
+                interpretation_parts.append(f"Predicted class: {classes[class_index] if class_index < len(classes) else class_index}")
+            else:  # Regression
+                interpretation_parts.append(f"Predicted value: {predicted_value:.3f}")
+            
+            interpretation_parts.append(f"Baseline: {baseline_value:.3f}")
+            interpretation_parts.append("Top contributing features:")
+            
+            for feature, value in top_features:
+                direction = "increases" if value > 0 else "decreases"
+                interpretation_parts.append(f"- {feature}: {value:+.3f} ({direction} prediction)")
+            
+            interpretation = "\n".join(interpretation_parts)
+            
+            logger.info("SHAP computation completed successfully")
+            
+            return ShapResponse(
+                shap_values=shap_values_dict,
+                baseline_value=baseline_value,
+                predicted_value=predicted_value,
+                feature_names=feature_names,
+                instance_values=instance_values,
+                interpretation=interpretation
+            )
+            
+        except Exception as e:
+            logger.error(f"SHAP computation failed: {str(e)}")
+            # Fallback to simple feature importance if SHAP fails
+            if hasattr(model, 'feature_importances_'):
+                importance = model.feature_importances_
+                shap_values_dict = {name: float(imp) for name, imp in zip(feature_names, importance)}
+            else:
+                shap_values_dict = {name: 0.0 for name in feature_names}
+            
+            return ShapResponse(
+                shap_values=shap_values_dict,
+                baseline_value=0.0,
+                predicted_value=predicted_value,
+                feature_names=feature_names,
+                instance_values={col: df.iloc[instance_index][col] for col in feature_columns},
+                interpretation=f"SHAP computation failed: {str(e)}. Showing fallback feature importance."
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SHAP endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/shap-overview", response_model=ShapOverviewResponse)
+async def compute_shap_overview(request: ShapOverviewRequest):
+    try:
+        if not SHAP_AVAILABLE:
+            raise HTTPException(
+                status_code=501, 
+                detail="SHAP libraries not available. Please install: pip install shap shapiq tabpfn-extensions"
+            )
+        
+        logger.info("Starting SHAP overview computation...")
+        
+        # Decode model package
+        try:
+            model_bytes = base64.b64decode(request.model_data)
+            buffer = BytesIO(model_bytes)
+            model_package = pickle.load(buffer)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to decode model data: {str(e)}")
+        
+        # Extract components from model package
+        model = model_package['model']
+        encoders = model_package['encoders']
+        target_encoder = model_package.get('target_encoder')
+        feature_columns = model_package['feature_columns']
+        target_column = model_package['target_column']
+        column_types = model_package.get('column_types', {})
+        classes = model_package.get('classes', [])
+        
+        # Convert request data to DataFrame and preprocess (same as individual SHAP)
+        df = pd.DataFrame(request.data)
+        
+        # Apply same preprocessing as training
+        logger.info("Applying preprocessing for SHAP overview...")
+        
+        # Apply column type conversions
+        for col in df.columns:
+            col_type = column_types.get(col, 'auto')
+            if col_type == 'numeric':
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            elif col_type == 'integer':
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+            elif col_type == 'categorical':
+                df[col] = df[col].astype('category')
+        
+        # Prepare features
+        X = df[feature_columns]
+        y = df[target_column] if target_column in df.columns else None
+        
+        # Apply same encoding as training (reuse the preprocessing logic)
+        categorical_cols = []
+        for col in X.columns:
+            col_type = column_types.get(col, 'auto')
+            if X[col].dtype in ['object', 'category'] or col_type in ['categorical', 'text']:
+                categorical_cols.append(col)
+        
+        # Apply one-hot encoding if it was used during training
+        if 'onehot' in encoders:
+            ohe = encoders['onehot']
+            onehot_columns = encoders.get('onehot_columns', [])
+            if onehot_columns:
+                cols_to_encode = [col for col in onehot_columns if col in X.columns]
+                if cols_to_encode:
+                    try:
+                        X_categorical = ohe.transform(X[cols_to_encode])
+                        feature_names = ohe.get_feature_names_out(cols_to_encode)
+                        X_cat_df = pd.DataFrame(X_categorical, columns=feature_names, index=X.index)
+                        X = pd.concat([X.drop(columns=cols_to_encode), X_cat_df], axis=1)
+                    except Exception as e:
+                        logger.warning(f"SHAP Overview: One-hot encoding failed: {e}")
+        
+        # Apply label encoding to remaining columns
+        for col, encoder in encoders.items():
+            if col not in ['onehot', 'onehot_columns'] and col in X.columns:
+                X[col] = encoder.transform(X[col].astype(str))
+        
+        # Get feature names for SHAP computation
+        feature_names = X.columns.tolist()
+        
+        # Select instances to compute SHAP for
+        num_instances = min(request.num_instances, len(X))  # Use requested number of instances, up to dataset size
+        instance_indices = np.random.choice(len(X), size=num_instances, replace=False)
+        X_instances = X.iloc[instance_indices]
+        X_background = X.iloc[:min(100, len(X))]  # Background for SHAP
+        
+        logger.info(f"Computing SHAP for {num_instances} instances with {len(X_background)} background samples")
+        
+        # Apply target encoding if needed
+        y_background = None
+        if y is not None and target_encoder is not None:
+            y_background = target_encoder.transform(y[:len(X_background)].astype(str))
+        elif y is not None:
+            y_background = y[:len(X_background)].values
+        
+        # Determine class index for classification
+        class_index = None
+        if len(classes) == 2:
+            class_index = 1  # Explain positive class for binary classification
+        elif len(classes) > 2:
+            class_index = None  # Let SHAP handle multiclass
+        
+        # Create SHAP explainer
+        try:
+            explainer = get_tabpfn_explainer(
+                model=model,
+                data=X_background.values,
+                labels=y_background if y_background is not None else np.zeros(len(X_background)),
+                index="SV",  # Standard Shapley Values - most reliable option
+                class_index=class_index
+            )
+            
+            # Compute SHAP values for multiple instances
+            budget = min(500, 2**len(feature_names))  # Smaller budget for multiple instances
+            logger.info(f"Computing SHAP values with budget {budget} for {num_instances} instances...")
+            # Detect current device for logging
+            current_device = detect_best_device()
+            logger.info(f"Using SV explainer on device: {current_device}")
+            
+            shap_results = []
+            import time
+            start_time = time.time()
+            
+            for i, instance_idx in enumerate(instance_indices):
+                try:
+                    iter_start = time.time()
+                    X_single = X.iloc[instance_idx:instance_idx+1]
+                    shap_result = explainer.explain(X_single.values, budget=budget)
+                    shap_results.append(shap_result)
+                    
+                    iter_time = time.time() - iter_start
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / (i + 1)
+                    eta = avg_time * (num_instances - i - 1)
+                    
+                    logger.info(f"SV explainer: {i+1}it [{elapsed:.0f}s<{eta:.0f}s, {avg_time:.2f}s/it] Instance {instance_idx}")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to compute SHAP for instance {instance_idx}: {e}")
+                    continue
+            
+            if not shap_results:
+                raise Exception("Failed to compute SHAP values for any instances")
+            
+            # Parse SHAP results into matrices
+            shap_values_matrix = []
+            feature_values_matrix = []
+            baseline_values = []
+            
+            for i, shap_result in enumerate(shap_results):
+                instance_shap = [0.0] * len(feature_names)
+                
+                if hasattr(shap_result, 'dict_values'):
+                    baseline_values.append(float(shap_result.dict_values.get((), 0.0)))
+                    
+                    # Extract individual feature contributions
+                    for key, shap_val in shap_result.dict_values.items():
+                        if isinstance(key, tuple) and len(key) == 1:
+                            feature_idx = key[0]
+                            if feature_idx < len(feature_names):
+                                instance_shap[feature_idx] = float(shap_val)
+                
+                shap_values_matrix.append(instance_shap)
+                
+                # Get feature values for this instance
+                instance_idx = instance_indices[i]
+                feature_values = []
+                for feature in feature_names:
+                    if feature in X.columns:
+                        val = X.iloc[instance_idx][feature]
+                        feature_values.append(float(val) if isinstance(val, (int, float)) else str(val))
+                    else:
+                        feature_values.append(0.0)
+                feature_values_matrix.append(feature_values)
+            
+            # Calculate mean absolute SHAP values for feature importance ranking
+            shap_array = np.array(shap_values_matrix)
+            mean_abs_shap = {
+                feature: float(np.mean(np.abs(shap_array[:, i])))
+                for i, feature in enumerate(feature_names)
+            }
+            
+            # Create summary plot data
+            summary_plot_data = {
+                "feature_importance_order": sorted(mean_abs_shap.keys(), key=lambda x: mean_abs_shap[x], reverse=True),
+                "shap_range": {
+                    feature: {
+                        "min": float(np.min(shap_array[:, i])),
+                        "max": float(np.max(shap_array[:, i])),
+                        "mean": float(np.mean(shap_array[:, i])),
+                        "std": float(np.std(shap_array[:, i]))
+                    }
+                    for i, feature in enumerate(feature_names)
+                }
+            }
+            
+            baseline_value = float(np.mean(baseline_values)) if baseline_values else 0.0
+            
+            logger.info(f"SHAP overview computation completed for {len(shap_values_matrix)} instances")
+            
+            return ShapOverviewResponse(
+                feature_names=feature_names,
+                shap_values_matrix=shap_values_matrix,
+                feature_values_matrix=feature_values_matrix,
+                baseline_value=baseline_value,
+                mean_abs_shap=mean_abs_shap,
+                summary_plot_data=summary_plot_data
+            )
+            
+        except Exception as e:
+            logger.error(f"SHAP overview computation failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"SHAP overview computation failed: {str(e)}")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SHAP overview endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
