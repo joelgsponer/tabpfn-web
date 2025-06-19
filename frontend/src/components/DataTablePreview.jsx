@@ -4,13 +4,21 @@ import { Button } from './ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table'
 import { PlayCircle, FileSpreadsheet } from 'lucide-react'
+import { ColumnConfiguration } from './ColumnConfiguration'
+import { ModelConfiguration } from './ModelConfiguration'
 
 export function DataTablePreview({ 
   fileData, 
   targetColumn, 
   onTargetColumnChange, 
   onRunModel,
-  isLoading 
+  isLoading,
+  columnTypes,
+  onColumnTypeChange,
+  excludedColumns,
+  onExcludedColumnsChange,
+  modelConfig,
+  onModelConfigChange
 }) {
   if (!fileData) return null
 
@@ -45,7 +53,7 @@ export function DataTablePreview({
                   <SelectValue placeholder="Select target column..." />
                 </SelectTrigger>
                 <SelectContent>
-                  {fileData.headers.map((header) => (
+                  {fileData.headers.filter(header => !excludedColumns.includes(header)).map((header) => (
                     <SelectItem key={header} value={header}>
                       {header}
                     </SelectItem>
@@ -107,6 +115,21 @@ export function DataTablePreview({
           </p>
         )}
       </CardContent>
+      
+      <ColumnConfiguration
+        fileData={fileData}
+        columnTypes={columnTypes}
+        onColumnTypeChange={onColumnTypeChange}
+        excludedColumns={excludedColumns}
+        onExcludedColumnsChange={onExcludedColumnsChange}
+      />
+      
+      <ModelConfiguration
+        fileData={fileData}
+        excludedColumns={excludedColumns}
+        modelConfig={modelConfig}
+        onModelConfigChange={onModelConfigChange}
+      />
     </Card>
   )
 }

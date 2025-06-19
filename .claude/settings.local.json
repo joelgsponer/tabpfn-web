@@ -12,7 +12,22 @@
       "mcp__promptcaddy__github-add-issue-v1",
       "Bash(gh issue create:*)",
       "Bash(git init:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(gh repo create:*)",
+      "Bash(git push:*)",
+      "Bash(gh issue comment:*)",
+      "Bash(npm install:*)",
+      "Bash(pip install:*)",
+      "Bash(source:*)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(python -m pip install:*)",
+      "Bash(gh issue close:*)",
+      "Bash(python -m pytest test_backend.py -v)",
+      "Bash(python:*)",
+      "Bash(uv run:*)",
+      "Bash(uv pip:*)",
+      "Bash(sed:*)"
     ],
     "deny": []
   },
