@@ -160,6 +160,3 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [SHAP](https://github.com/slundberg/shap) - Model interpretability framework
 - [Shadcn/ui](https://ui.shadcn.com/) - UI component library
 
-## 📧 Contact
-
-For questions or support, please open an issue in the GitHub repository.
